@@ -185,7 +185,7 @@ def purge_sent_email(sender, pwd, msg_id):
 
         typ, data = mail.search(None, f'(HEADER Message-ID "{msg_id}")')
         if typ == 'OK' and data[0]:
-            for num in data[0].split(): mail.store(num, '+FLAGS', '\Deleted')
+            for num in data[0].split(): mail.store(num, '+FLAGS', r'\Deleted')
             mail.expunge()
             logging.info(f"🧹 Purged email from {sender}'s Sent box.")
         mail.logout()

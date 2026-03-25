@@ -5,3 +5,5 @@ downloads/
 activity.log
 state.json
 cookies.txt
+cloudflared
+cloudflared.exe

@@ -1,0 +1,7 @@
+requests
+psutil
+waitress
+yt-dlp
+mutagen
+Flask
+python-dotenv

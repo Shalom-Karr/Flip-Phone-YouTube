@@ -24,7 +24,7 @@ load_dotenv()
 
 # --- AUTO-INSTALL & UPDATE ---
 def install_libs():
-    libs = ['requests', 'psutil', 'waitress', 'yt-dlp', 'mutagen', 'python-dotenv']
+    libs = ['requests', 'psutil', 'waitress', 'yt-dlp', 'mutagen', 'python-dotenv', 'pytubefix']
     for lib in libs:
         try: 
             __import__(lib.replace('-', '_'))
@@ -432,7 +432,7 @@ def action_clear_history():
 @app.route('/api/queue/toggle_pause', methods=['POST'])
 def api_queue_toggle_pause():
     global QUEUE_PAUSED; QUEUE_PAUSED = not QUEUE_PAUSED
-    return jsonify({"message": f"Queue {"Paused" if QUEUE_PAUSED else "Resumed"}", "paused": QUEUE_PAUSED})
+    return jsonify({"message": f"Queue {'Paused' if QUEUE_PAUSED else 'Resumed'}", "paused": QUEUE_PAUSED})
 
 @app.route('/api/queue/cancel', methods=['POST'])
 def api_queue_cancel():
@@ -504,6 +504,44 @@ class YTDLPLogger:
         self.errors.append(re.sub(r'\x1b[^m]*m', '', msg).strip())
         logging.error(f"yt-dlp Error: {self.errors[-1]}")
 
+BOT_DETECTION_KEYWORDS = ("sign in", "bot", "confirm", "cookies")
+
+def extract_video_id(url):
+    patterns = [
+        r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)([A-Za-z0-9_-]{11})'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def fallback_download_pytubefix(video_id, output_dir, job_id, quality):
+    from pytubefix import YouTube
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    logging.info(f"🔄 [Job {job_id}] yt-dlp failed with bot detection. Retrying with pytubefix...")
+    yt = YouTube(url)
+    fname_base = f"vid_{job_id}"
+    if quality == 'audio':
+        stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
+        if not stream:
+            raise Exception("pytubefix: No audio stream found")
+    else:
+        stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
+        if not stream:
+            stream = yt.streams.get_highest_resolution()
+        if not stream:
+            raise Exception("pytubefix: No suitable video stream found")
+    downloaded_path = stream.download(output_path=output_dir, filename=fname_base)
+    if not downloaded_path or not os.path.exists(downloaded_path):
+        raise Exception("pytubefix: Download failed, file not found after download")
+    logging.info(f"✅ [Job {job_id}] pytubefix downloaded: {os.path.basename(downloaded_path)}")
+    return {
+        'title': yt.title,
+        'thumbnail': yt.thumbnail_url or '',
+        'duration': yt.length
+    }
+
 def background_worker(youtube_url, job_id, quality='480p'):
     if not youtube_url: return
     
@@ -569,7 +607,16 @@ def background_worker(youtube_url, job_id, quality='480p'):
                 info = ydl.extract_info(youtube_url, download=True)
                 if not info: 
                     err_msg = job_logger.errors[-1] if job_logger.errors else "Unknown yt-dlp error"
-                    raise Exception(f"Download Failed: {err_msg}")
+                    if any(kw in err_msg.lower() for kw in BOT_DETECTION_KEYWORDS):
+                        video_id = extract_video_id(youtube_url)
+                        if video_id:
+                            if job_id in JOBS: JOBS[job_id]['status'] = "Retrying with backup downloader..."
+                            try:
+                                info = fallback_download_pytubefix(video_id, DOWNLOAD_FOLDER, job_id, quality)
+                            except Exception as fb_err:
+                                logging.error(f"[Job {job_id}] pytubefix fallback also failed: {fb_err}")
+                    if not info:
+                        raise Exception(f"Download Failed: {err_msg}")
                 
                 if quality == 'auto': 
                     dur = info.get('duration', 0)

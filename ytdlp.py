@@ -24,7 +24,7 @@ load_dotenv()
 
 # --- AUTO-INSTALL & UPDATE ---
 def install_libs():
-    libs = ['requests', 'psutil', 'waitress', 'yt-dlp', 'mutagen', 'python-dotenv']
+    libs = ['requests', 'psutil', 'waitress', 'yt-dlp', 'mutagen', 'python-dotenv', 'pytubefix', 'nodejs-wheel-binaries']
     for lib in libs:
         try: 
             __import__(lib.replace('-', '_'))
@@ -488,6 +488,100 @@ def api_update():
     logging.info("🚀 Force Update command received!")
     return jsonify({"status": "Update Signal Received"})
 
+def extract_video_id(url):
+    """Extract YouTube video ID from various URL formats."""
+    patterns = [
+        r'(?:youtube\.com/watch\?.*v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def fallback_download_pytubefix(video_id, output_dir, job_id, quality='480p'):
+    """
+    3-layer pytubefix fallback with po_token support.
+    Per: https://pytubefix.readthedocs.io/en/latest/user/po_token.html
+    """
+    from pytubefix import YouTube
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    output_filename = f"vid_{job_id}.mp4"
+
+    # --- ATTEMPT 1: pytubefix with 'WEB' client (auto po_token via BotGuard/NodeJS) ---
+    try:
+        logging.info(f"🔄 [Job {job_id}] Fallback Attempt 1: pytubefix with WEB client (auto po_token)...")
+        yt = YouTube(url, 'WEB')
+
+        if quality == 'audio':
+            stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
+        else:
+            stream = yt.streams.filter(file_extension='mp4', progressive=False).order_by('resolution').desc().first()
+            if not stream:
+                stream = yt.streams.get_highest_resolution()
+
+        if stream:
+            stream.download(output_path=output_dir, filename=output_filename)
+            logging.info(f"✅ [Job {job_id}] pytubefix WEB client succeeded: {yt.title}")
+            return {
+                'title': yt.title or 'Unknown',
+                'thumbnail': yt.thumbnail_url or '',
+                'duration': yt.length or 0
+            }
+    except Exception as e1:
+        logging.warning(f"⚠️ [Job {job_id}] pytubefix WEB client failed: {e1}")
+
+    # --- ATTEMPT 2: pytubefix with use_po_token=True + token_file (manual po_token) ---
+    token_file_path = os.path.join(os.getcwd(), 'token_file.json')
+    if os.path.exists(token_file_path):
+        try:
+            logging.info(f"🔄 [Job {job_id}] Fallback Attempt 2: pytubefix with manual po_token from {token_file_path}...")
+            yt = YouTube(url, use_po_token=True, token_file=token_file_path)
+
+            if quality == 'audio':
+                stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
+            else:
+                stream = yt.streams.filter(file_extension='mp4', progressive=False).order_by('resolution').desc().first()
+                if not stream:
+                    stream = yt.streams.get_highest_resolution()
+
+            if stream:
+                stream.download(output_path=output_dir, filename=output_filename)
+                logging.info(f"✅ [Job {job_id}] pytubefix manual po_token succeeded: {yt.title}")
+                return {
+                    'title': yt.title or 'Unknown',
+                    'thumbnail': yt.thumbnail_url or '',
+                    'duration': yt.length or 0
+                }
+        except Exception as e2:
+            logging.warning(f"⚠️ [Job {job_id}] pytubefix manual po_token failed: {e2}")
+    else:
+        logging.info(f"ℹ️ [Job {job_id}] No token_file.json found, skipping manual po_token attempt.")
+
+    # --- ATTEMPT 3: pytubefix basic (no po_token, last resort) ---
+    try:
+        logging.info(f"🔄 [Job {job_id}] Fallback Attempt 3: pytubefix basic (no po_token)...")
+        yt = YouTube(url)
+
+        if quality == 'audio':
+            stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
+        else:
+            stream = yt.streams.get_highest_resolution()
+
+        if stream:
+            stream.download(output_path=output_dir, filename=output_filename)
+            logging.info(f"✅ [Job {job_id}] pytubefix basic succeeded: {yt.title}")
+            return {
+                'title': yt.title or 'Unknown',
+                'thumbnail': yt.thumbnail_url or '',
+                'duration': yt.length or 0
+            }
+    except Exception as e3:
+        logging.error(f"❌ [Job {job_id}] All pytubefix attempts failed. Last error: {e3}")
+
+    return None  # All attempts failed
+
 # --- WORKER ---
 class YTDLPLogger:
     def __init__(self):
@@ -567,26 +661,47 @@ def background_worker(youtube_url, job_id, quality='480p'):
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(youtube_url, download=True)
-                if not info: 
-                    err_msg = job_logger.errors[-1] if job_logger.errors else "Unknown yt-dlp error"
+
+            # --- FALLBACK: pytubefix if yt-dlp fails with bot detection ---
+            downloaded_files = glob.glob(os.path.join(DOWNLOAD_FOLDER, f"vid_{job_id}.*"))
+            if not info or not downloaded_files:
+                err_msg = job_logger.errors[-1] if job_logger.errors else (job_logger.messages[-1] if job_logger.messages else "yt-dlp failed silently")
+                bot_keywords = ["Sign in", "bot", "confirm", "cookies", "authentication"]
+                if any(kw.lower() in err_msg.lower() for kw in bot_keywords):
+                    logging.warning(f"🤖 [Job {job_id}] yt-dlp bot detection error. Retrying with pytubefix...")
+                    if job_id in JOBS: JOBS[job_id]['status'] = "Retrying with backup downloader..."
+                    video_id = extract_video_id(youtube_url)
+                    if video_id:
+                        fallback_info = fallback_download_pytubefix(video_id, DOWNLOAD_FOLDER, job_id, quality)
+                        if fallback_info:
+                            info = fallback_info
+                            fallback_files = glob.glob(os.path.join(DOWNLOAD_FOLDER, f"vid_{job_id}.*"))
+                            if not fallback_files:
+                                raise Exception(f"Fallback download produced no output file: {err_msg}")
+                            filepath = fallback_files[0]
+                            filename = os.path.basename(filepath)
+                        else:
+                            raise Exception(f"All download attempts failed: {err_msg}")
+                    else:
+                        raise Exception(f"Download Failed (could not extract video ID): {err_msg}")
+                elif not info:
                     raise Exception(f"Download Failed: {err_msg}")
-                
-                if quality == 'auto': 
-                    dur = info.get('duration', 0)
-                    quality = '480p' if dur < 360 else ('360p' if dur <= 540 else '240p')
-                
+                else:
+                    raise Exception(f"File not found in folder ({err_msg})")
+            else:
+                filepath = downloaded_files[0]
+                filename = os.path.basename(filepath)
+
+            if quality == 'auto': 
+                dur = info.get('duration', 0)
+                quality = '480p' if dur < 360 else ('360p' if dur <= 540 else '240p')
+            
+            if job_id in JOBS:
                 JOBS[job_id].update({
                     'title': info.get('title', 'Unknown'), 
                     'thumbnail': info.get('thumbnail', '')
                 })
-                save_state()
-                
-                downloaded_files = glob.glob(os.path.join(DOWNLOAD_FOLDER, f"vid_{job_id}.*"))
-                if not downloaded_files:
-                    err_msg = job_logger.errors[-1] if job_logger.errors else (job_logger.messages[-1] if job_logger.messages else "yt-dlp failed silently")
-                    raise Exception(f"File not found in folder ({err_msg})")
-                filepath = downloaded_files[0]
-                filename = os.path.basename(filepath)
+            save_state()
 
             acquire_lock(filename) # Lock it from Watchdog
             try:

@@ -432,7 +432,7 @@ def action_clear_history():
 @app.route('/api/queue/toggle_pause', methods=['POST'])
 def api_queue_toggle_pause():
     global QUEUE_PAUSED; QUEUE_PAUSED = not QUEUE_PAUSED
-    return jsonify({"message": f"Queue {"Paused" if QUEUE_PAUSED else "Resumed"}", "paused": QUEUE_PAUSED})
+    return jsonify({"message": f"Queue {'Paused' if QUEUE_PAUSED else 'Resumed'}", "paused": QUEUE_PAUSED})
 
 @app.route('/api/queue/cancel', methods=['POST'])
 def api_queue_cancel():

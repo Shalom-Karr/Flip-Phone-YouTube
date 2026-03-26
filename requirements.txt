@@ -5,3 +5,5 @@ yt-dlp
 mutagen
 Flask
 python-dotenv
+pytubefix
+nodejs-wheel-binaries
